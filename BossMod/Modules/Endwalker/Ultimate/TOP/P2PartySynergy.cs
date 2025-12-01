@@ -64,8 +64,8 @@ sealed class P2PartySynergy(BossModule module) : CommonAssignments(module)
         var order = iconID switch
         {
             (uint)IconID.PartySynergyCross => 2,
-            (uint)IconID.PartySynergySquare => 1,
-            (uint)IconID.PartySynergyCircle => 4,
+            (uint)IconID.PartySynergySquare => 4,
+            (uint)IconID.PartySynergyCircle => 1,
             (uint)IconID.PartySynergyTriangle => 3,
             _ => 0
         };
