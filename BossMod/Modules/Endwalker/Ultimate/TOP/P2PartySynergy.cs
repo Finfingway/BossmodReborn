@@ -1,362 +1,168 @@
 ﻿namespace BossMod.Endwalker.Ultimate.TOP;
 
-sealed class P2PartySynergy(BossModule module) : CommonAssignments(module)
+sealed class P3OversampledWaveCannon(BossModule module) : BossComponent(module)
 {
-    public enum Glitch { Unknown, Mid, Remote }
-
-    public Glitch ActiveGlitch;
-    public bool EnableDistanceHints;
+    private Actor? _boss;
+    private Angle _bossAngle;
+    private readonly Angle[] _playerAngles = new Angle[PartyState.MaxPartySize];
+    private readonly int[] _playerOrder = new int[PartyState.MaxPartySize];
+    private int _numPlayerAngles;
+    private readonly List<int> _monitorOrder = [];
     private readonly TOPConfig _config = Service.Config.Get<TOPConfig>();
 
-    protected override (GroupAssignmentUnique assignment, bool global) Assignments()
-    {
-        var config = Service.Config.Get<TOPConfig>();
-        return (config.P2PartySynergyAssignments, config.P2PartySynergyGlobalPriority);
-    }
-
-    public override void AddGlobalHints(GlobalHints hints)
-    {
-        if (ActiveGlitch != Glitch.Unknown)
-            hints.Add($"Glitch: {ActiveGlitch}");
-    }
+    private static readonly AOEShapeRect _shape = new(50, 50);
 
     public override void AddHints(int slot, Actor actor, TextHints hints)
     {
-        base.AddHints(slot, actor, hints);
-        if (EnableDistanceHints && FindPartner(slot) is var partner && partner != null)
-        {
-            var distSq = (partner.Position - actor.Position).LengthSq();
-            var range = DistanceRange;
-            if (distSq < range.min * range.min)
-                hints.Add("Move away from partner!");
-            else if (distSq > range.max * range.max)
-                hints.Add("Move closer to partner!");
-        }
+        if (_playerOrder[slot] != 0)
+            hints.Add($"Order: {(IsMonitor(slot) != default ? "M" : "N")}{_playerOrder[slot]}", false);
+
+        var numHitBy = AOEs(slot).Count(a => !a.source && _shape.Check(actor.Position, a.origin, a.rot));
+        if (numHitBy != 1)
+            hints.Add($"Hit by {numHitBy} monitors!");
+    }
+
+    public override void AddMovementHints(int slot, Actor actor, MovementHints movementHints)
+    {
+        foreach (var p in SafeSpots(slot).Where(p => p.assigned))
+            movementHints.Add(actor.Position, p.pos, Colors.Safe);
+    }
+
+    public override void DrawArenaBackground(int pcSlot, Actor pc)
+    {
+        foreach (var a in AOEs(pcSlot))
+            _shape.Draw(Arena, a.origin, a.rot, a.safe ? Colors.SafeFromAOE : default);
     }
 
     public override void DrawArenaForeground(int pcSlot, Actor pc)
     {
-        var partner = FindPartner(pcSlot);
-        if (partner != null)
-        {
-            var distSq = (partner.Position - pc.Position).LengthSq();
-            var range = DistanceRange;
-            Arena.AddLine(pc.Position, partner.Position, distSq < range.min * range.min || distSq > range.max * range.max ? Colors.Danger : Colors.Safe);
-        }
+        foreach (var p in SafeSpots(pcSlot))
+            Arena.AddCircle(p.pos, 1f, p.assigned ? Colors.Safe : default);
     }
 
     public override void OnStatusGain(Actor actor, ref ActorStatus status)
     {
-        switch (status.ID)
+        var angle = status.ID switch
         {
-            case (uint)SID.MidGlitch:
-                ActiveGlitch = Glitch.Mid;
-                break;
-            case (uint)SID.RemoteGlitch:
-                ActiveGlitch = Glitch.Remote;
-                break;
+            (uint)SID.OversampledWaveCannonLoadingL => 90f.Degrees(),
+            (uint)SID.OversampledWaveCannonLoadingR => -90f.Degrees(),
+            _ => default
+        };
+        if (angle != default && Raid.FindSlot(actor.InstanceID) is var slot && slot >= 0)
+        {
+            _playerAngles[slot] = angle;
+            if (++_numPlayerAngles == 3)
+            {
+                int n = 0, m = 0;
+                foreach (var sg in Service.Config.Get<TOPConfig>().P3MonitorsAssignments.Resolve(Raid).OrderBy(sg => sg.group))
+                {
+                    _playerOrder[sg.slot] = IsMonitor(sg.slot) ? ++m : ++n;
+                    if (IsMonitor(sg.slot))
+                        _monitorOrder.Add(sg.slot);
+                }
+            }
         }
     }
 
-    public override void OnEventIcon(Actor actor, uint iconID, ulong targetID)
+    public override void OnCastStarted(Actor caster, ActorCastInfo spell)
     {
-        // assuming standard 'blue-purple-orange-green' order
-        var order = iconID switch
+        var angle = spell.Action.ID switch
         {
-            (uint)IconID.PartySynergyCross => 2,
-            (uint)IconID.PartySynergySquare => 4,
-            (uint)IconID.PartySynergyCircle => 1,
-            (uint)IconID.PartySynergyTriangle => 3,
-            _ => 0
+            (uint)AID.OversampledWaveCannonL => 90f.Degrees(),
+            (uint)AID.OversampledWaveCannonR => -90f.Degrees(),
+            _ => default
         };
-        Assign(actor, order);
-    }
-
-    private Actor? FindPartner(int slot)
-    {
-        var ps = PlayerStates[slot];
-        var partnerSlot = ps.Order > 0 ? Array.FindIndex(PlayerStates, s => s.Order == ps.Order && s.Group != ps.Group) : -1;
-        return Raid[partnerSlot];
-    }
-
-    private (float min, float max) DistanceRange => ActiveGlitch switch
-    {
-        Glitch.Mid => (20, 26),
-        Glitch.Remote => (34, 50),
-        _ => (0, 50)
-    };
-
-    // determine north => south order for player based on what glitch is active, used for flare stacks
-    public int GetNorthSouthOrder(PlayerState st)
-    {
-        if (st.Group is < 1 or > 2)
-            return 0;
-
-        if (st.Group == 1 || ActiveGlitch == Glitch.Mid)
-            return st.Order;
-
-        return st.Order switch
+        if (angle != default)
         {
-            1 => 4,
-            2 => _config.P2PartySynergyG2ReverseAll ? 3 : 2,
-            3 => _config.P2PartySynergyG2ReverseAll ? 2 : 3,
-            4 => 1,
-            _ => 0
-        };
-    }
-}
-
-sealed class P2PartySynergyDoubleAOEs(BossModule module) : Components.GenericAOEs(module)
-{
-    public List<AOEInstance> AOEs = [];
-
-    public override ReadOnlySpan<AOEInstance> ActiveAOEs(int slot, Actor actor) => CollectionsMarshal.AsSpan(AOEs);
-
-    public override void OnEventCast(Actor caster, ActorCastEvent spell)
-    {
-        if (spell.Action.ID is (uint)AID.BeyondStrength or (uint)AID.EfficientBladework or (uint)AID.SuperliminalSteel or (uint)AID.OptimizedBlizzard)
-            ++NumCasts;
-    }
-
-    public override void OnActorPlayActionTimelineEvent(Actor actor, ushort id)
-    {
-        if (id != 0x1E43)
-            return;
-        var pos = actor.Position.Quantized();
-        var act = WorldState.FutureTime(5.1d);
-        var rot = actor.Rotation;
-        switch (actor.OID)
-        {
-            case (uint)OID.OmegaMHelper:
-                if (actor.ModelState.ModelState == 4)
-                {
-                    AOEs.Add(new(P5OmegaDoubleAOEs.Shapes[0], pos, rot, act));
-                }
-                else
-                {
-                    AOEs.Add(new(P5OmegaDoubleAOEs.Shapes[1], pos, rot, act));
-                }
-                break;
-            case (uint)OID.OmegaFHelper:
-                if (actor.ModelState.ModelState == 4)
-                {
-                    AOEs.Add(new(P5OmegaDoubleAOEs.Shapes[2], pos, rot + 90f.Degrees(), act));
-                    AOEs.Add(new(P5OmegaDoubleAOEs.Shapes[2], pos, rot - 90f.Degrees(), act));
-                }
-                else
-                {
-                    AOEs.Add(new(P5OmegaDoubleAOEs.Shapes[3], pos, rot, act));
-                }
-                break;
+            _boss = caster;
+            _bossAngle = angle;
         }
     }
+
+    private bool IsMonitor(int slot) => _playerAngles[slot] != default;
+
+    private List<(WPos pos, bool assigned)> SafeSpots(int slot)
+    {
+        if (_numPlayerAngles < 3 || _bossAngle == default)
+            return [];
+
+        WPos adjust(float x, float z) => Arena.Center + new WDir(_bossAngle.Rad < 0 ? -x : x, z);
+        var safespots = new List<(WPos, bool)>(5);
+        if (IsMonitor(slot))
+        {
+            var nextSlot = 0;
+            if (!_config.P3LastMonitorSouth)
+                safespots.Add((adjust(10f, -11f), _playerOrder[slot] == ++nextSlot));
+            safespots.Add((adjust(-11f, -9f), _playerOrder[slot] == ++nextSlot));
+            safespots.Add((adjust(-11f, +9f), _playerOrder[slot] == ++nextSlot));
+            if (_config.P3LastMonitorSouth)
+                safespots.Add((adjust(10f, 11f), _playerOrder[slot] == ++nextSlot));
+        }
+        else
+        {
+            var nextSlot = 0;
+            safespots.Add((adjust(1f, -15f), _playerOrder[slot] == ++nextSlot));
+            if (_config.P3LastMonitorSouth)
+                safespots.Add((adjust(10f, -11f), _playerOrder[slot] == ++nextSlot));
+            safespots.Add((adjust(15f, -4f), _playerOrder[slot] == ++nextSlot));
+            safespots.Add((adjust(15f, +4f), _playerOrder[slot] == ++nextSlot));
+            if (!_config.P3LastMonitorSouth)
+                safespots.Add((adjust(10f, 11f), _playerOrder[slot] == ++nextSlot));
+            safespots.Add((adjust(1f, 15f), _playerOrder[slot] == ++nextSlot));
+        }
+        return safespots;
+    }
+
+    private (WPos origin, Angle rot, bool safe, bool source)[] AOEs(int slot)
+    {
+        var isMonitor = IsMonitor(slot);
+        var order = (isMonitor, _playerOrder[slot]) switch
+        {
+            (_, 1) => 2, // N1/M1 are hit by M2
+            (true, _) => 0, // M2/M3 are hit by boss
+            (_, 2 or 3) => 1, // N2/N3 are hit by M1
+            _ => 3, // N4/N5 are hit by M3
+        };
+        var aoes = AOEs();
+        var len = aoes.Length;
+        var aoesNew = new (WPos, Angle, bool, bool)[len];
+        var index = 0;
+        for (var i = 0; i < len; ++i)
+        {
+            ref readonly var aoe = ref aoes[i];
+            if (aoe.origin != null)
+            {
+                aoesNew[index++] = (aoe.origin.Position, aoe.origin.Rotation + aoe.offset, aoe.order == order, isMonitor && aoe.order == _playerOrder[slot]);
+            }
+        }
+        return aoesNew[..index];
+    }
+
+    private (Actor? origin, Angle offset, int order)[] AOEs()
+    {
+        var count = _monitorOrder.Count;
+        var aoes = new (Actor?, Angle, int)[count + 1];
+        aoes[0] = (_boss, _bossAngle, 0);
+        for (var i = 0; i < _monitorOrder.Count; ++i)
+        {
+            var slot = _monitorOrder[i];
+            aoes[i + 1] = (Raid[slot], _playerAngles[slot], i + 1);
+        }
+        return aoes;
+    }
 }
 
-sealed class P2PartySynergyOptimizedFire : Components.UniformStackSpread
+sealed class P3OversampledWaveCannonSpread(BossModule module) : Components.UniformStackSpread(module, default, 7f)
 {
-    public P2PartySynergyOptimizedFire(BossModule module) : base(module, default, 7f)
+    public override void OnCastStarted(Actor caster, ActorCastInfo spell)
     {
-        AddSpreads(Raid.WithoutSlot(true, true, true));
+        if (spell.Action.ID is (uint)AID.OversampledWaveCannonR or (uint)AID.OversampledWaveCannonL)
+            AddSpreads(Raid.WithoutSlot(true, true, true), Module.CastFinishAt(spell));
     }
 
     public override void OnEventCast(Actor caster, ActorCastEvent spell)
     {
-        if (spell.Action.ID == (uint)AID.OptimizedFire)
+        if (spell.Action.ID == (uint)AID.OversampledWaveCannonAOE)
             Spreads.Clear();
-    }
-}
-
-sealed class P2PartySynergyOpticalLaser(BossModule module) : Components.GenericAOEs(module, (uint)AID.OpticalLaser)
-{
-    private readonly P2PartySynergy? _synergy = module.FindComponent<P2PartySynergy>();
-    private readonly Actor? _source = module.Enemies((uint)OID.OpticalUnit).FirstOrDefault();
-    private DateTime _activation;
-
-    private static readonly AOEShapeRect _shape = new(100f, 8f);
-
-    public void Show()
-    {
-        _activation = WorldState.FutureTime(6.8d);
-    }
-
-    public override ReadOnlySpan<AOEInstance> ActiveAOEs(int slot, Actor actor)
-    {
-        if (_activation != default && _source != null)
-            return new AOEInstance[1] { new(_shape, _source.Position.Quantized(), _source.Rotation, _activation) };
-        return [];
-    }
-
-    public override void DrawArenaForeground(int pcSlot, Actor pc)
-    {
-        Arena.Actor(_source, Colors.Object, true);
-        var pos = AssignedPosition(pcSlot);
-        if (pos != default)
-            Arena.AddCircle(Arena.Center + pos, 1f, Colors.Safe);
-    }
-
-    private WDir AssignedPosition(int slot)
-    {
-        if (_synergy == null || _source == null || _activation == default)
-            return default;
-
-        var ps = _synergy.PlayerStates[slot];
-        if (ps.Order == 0 || ps.Group == 0 || _synergy.ActiveGlitch == P2PartySynergy.Glitch.Unknown)
-            return default;
-
-        var eyeOffset = _source.Position - Arena.Center;
-        var toRelNorth = eyeOffset.Normalized();
-        var order = _synergy.GetNorthSouthOrder(ps);
-        var centerOffset = _synergy.ActiveGlitch == P2PartySynergy.Glitch.Remote && order is 2 or 3 ? 17.5f : 11;
-        return 10f * (2.5f - order) * toRelNorth + centerOffset * (ps.Group == 1 ? toRelNorth.OrthoL() : toRelNorth.OrthoR());
-    }
-}
-
-sealed class P2PartySynergyDischarger(BossModule module) : Components.GenericKnockback(module, (uint)AID.Discharger)
-{
-    public override ReadOnlySpan<Knockback> ActiveKnockbacks(int slot, Actor actor)
-    {
-        return new Knockback[1] { new(Arena.Center, 13f) }; // TODO: activation
-    }
-}
-
-class P2PartySynergyEfficientBladework : Components.GenericAOEs
-{
-    private readonly P2PartySynergy? _synergy;
-    private DateTime _activation;
-    private readonly List<Actor> _sources = [];
-    private int _firstStackSlot = -1;
-    private BitMask _firstGroup;
-    private string _swaps = "";
-    private readonly TOPConfig _config = Service.Config.Get<TOPConfig>();
-
-    private static readonly AOEShapeCircle _shape = new(10);
-
-    public P2PartySynergyEfficientBladework(BossModule module) : base(module)
-    {
-        _synergy = module.FindComponent<P2PartySynergy>();
-        _sources.AddRange(module.Enemies((uint)OID.OmegaF));
-        // by default, use same group as for synergy
-        if (_synergy != null)
-            _firstGroup = Raid.WithSlot(true, true, true).WhereSlot(s => _synergy.PlayerStates[s].Group == 1).Mask();
-    }
-
-    public override ReadOnlySpan<AOEInstance> ActiveAOEs(int slot, Actor actor)
-    {
-        if (_activation != default)
-        {
-            var count = _sources.Count;
-            var aoes = new AOEInstance[count];
-            for (var i = 0; i < count; ++i)
-                aoes[i] = new(_shape, _sources[i].Position.Quantized(), default, _activation);
-            return aoes;
-        }
-        return [];
-    }
-
-    public override void AddGlobalHints(GlobalHints hints)
-    {
-        if (_swaps.Length > 0)
-            hints.Add($"Swaps: {_swaps}");
-    }
-
-    public override void DrawArenaForeground(int pcSlot, Actor pc)
-    {
-        var pos = AssignedPosition(pcSlot);
-        if (pos != default)
-            Arena.AddCircle(Arena.Center + pos, 1f, Colors.Safe);
-    }
-
-    public override void OnActorPlayActionTimelineEvent(Actor actor, ushort id)
-    {
-        if (id == 0x1E43 && actor.OID == (uint)OID.OmegaMHelper)
-            _sources.Add(actor);
-    }
-
-    public override void OnEventCast(Actor caster, ActorCastEvent spell)
-    {
-        switch (spell.Action.ID)
-        {
-            case (uint)AID.EfficientBladework:
-                ++NumCasts;
-                break;
-            case (uint)AID.OpticalLaser:
-                _activation = WorldState.FutureTime(9.8d);
-                break;
-        }
-    }
-
-    public override void OnEventIcon(Actor actor, uint iconID, ulong targetID)
-    {
-        if (iconID == (uint)IconID.Spotlight && Raid.FindSlot(actor.InstanceID) is var slot && slot >= 0 && _synergy != null)
-        {
-            if (_firstStackSlot < 0)
-            {
-                _firstStackSlot = slot;
-            }
-            else
-            {
-                // as soon as we have two stacks, check whether they are from same group - if so, we need adjusts
-                var s1 = _synergy.PlayerStates[_firstStackSlot];
-                var s2 = _synergy.PlayerStates[slot];
-                if (s1.Group == s2.Group)
-                {
-                    // need adjust
-                    var s1Order = _synergy.GetNorthSouthOrder(s1);
-                    var s2Order = _synergy.GetNorthSouthOrder(s2);
-                    var adjustOrder = _config.P2PartySynergyStackSwapSouth
-                        ? s1Order > s2Order ? s1.Order : s2.Order // south = higher order will swap
-                        : s1Order > s2Order ? s2.Order : s1.Order; // north = lower
-
-                    for (var s = 0; s < _synergy.PlayerStates.Length; ++s)
-                    {
-                        if (_synergy.PlayerStates[s].Order == adjustOrder)
-                        {
-                            _firstGroup.Toggle(s);
-                            if (_swaps.Length > 0)
-                                _swaps += ", ";
-                            _swaps += Raid[s]?.Name ?? "";
-                        }
-                    }
-                }
-                else
-                {
-                    _swaps = "None";
-                }
-            }
-        }
-    }
-
-    private WDir AssignedPosition(int slot)
-    {
-        if (_activation == default || _synergy == null || _sources.Count == 0)
-            return default;
-
-        // assumption: first source (F) is our relative north, G1 always goes to relative west, G2 goes to relative S/E depending on glitch
-        var relNorth = 1.4f * (_sources[0].Position - Arena.Center);
-        return _firstGroup[slot] ? relNorth.OrthoL() : _synergy.ActiveGlitch == P2PartySynergy.Glitch.Mid ? -relNorth : relNorth.OrthoR();
-    }
-}
-
-sealed class P2PartySynergySpotlight(BossModule module) : Components.UniformStackSpread(module, 6f, default, 4, 4)
-{
-    private readonly List<Actor> _stackTargets = []; // don't show anything until knockbacks are done, to reduce visual clutter
-
-    public override void OnEventIcon(Actor actor, uint iconID, ulong targetID)
-    {
-        if (iconID == (uint)IconID.Spotlight)
-            _stackTargets.Add(actor);
-    }
-
-    public override void OnEventCast(Actor caster, ActorCastEvent spell)
-    {
-        switch (spell.Action.ID)
-        {
-            case (uint)AID.Discharger:
-                AddStacks(_stackTargets);
-                break;
-            case (uint)AID.Spotlight:
-                Stacks.RemoveAll(s => s.Target.InstanceID == spell.MainTargetID);
-                break;
-        }
     }
 }
