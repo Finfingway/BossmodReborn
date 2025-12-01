@@ -7,34 +7,59 @@ sealed class P3OversampledWaveCannonSafe : BossComponent
     private readonly Angle[] _playerAngles = new Angle[PartyState.MaxPartySize];
     private readonly int[] _playerOrder = new int[PartyState.MaxPartySize];
     private int _numPlayerAngles;
+    private readonly List<int> _monitorOrder = new();
+
+    private readonly TOPConfig _config = Service.Config.Get<TOPConfig>();
+
+    private static readonly AOEShapeRect _shape = new(50, 50);
 
     private static readonly Dictionary<string, WPos> BasePositions = new()
     {
-        // 中央
         ["Center"] = new WPos(100, 100),
-        // 北
         ["NorthNear"] = new WPos(100, 90.5f),
         ["NorthFar"]  = new WPos(100, 81.0f),
-        // 南
         ["SouthNear"] = new WPos(100, 109.5f),
         ["SouthFar"]  = new WPos(100, 119.0f),
-        // 東
         ["EastNear"]  = new WPos(109.5f, 100),
         ["EastFar"]   = new WPos(119.0f, 100),
-        // 西
         ["WestNear"]  = new WPos(90.5f, 100),
         ["WestFar"]   = new WPos(81.0f, 100),
     };
 
-    private readonly TOPConfig _config = Service.Config.Get<TOPConfig>();
-
-    private bool IsTH(int slot) => Raid.Roles[slot] is Role.Tank or Role.Healer;
-    private bool IsDPS(int slot) => Raid.Roles[slot] is Role.Melee or Role.Ranged;
+    private bool IsTH(int slot) => Raid[slot].Role is Role.Tank or Role.Healer;
+    private bool IsDPS(int slot) => Raid[slot].Role is Role.Melee or Role.Ranged;
     private bool IsMonitor(int slot) => _playerAngles[slot] != default;
+
+    public override void AddHints(int slot, Actor actor, TextHints hints)
+    {
+        if (_playerOrder[slot] != 0)
+            hints.Add($"Order: {(IsMonitor(slot) ? "M" : "N")}{_playerOrder[slot]}", false);
+
+        int numHitBy = AOEs(slot).Count(a => !a.source && _shape.Check(actor.Position, a.origin, a.rot));
+        if (numHitBy != 1)
+            hints.Add($"Hit by {numHitBy} monitors!");
+    }
+
+    public override void AddMovementHints(int slot, Actor actor, MovementHints movementHints)
+    {
+        foreach (var p in SafeSpots(slot).Where(p => p.assigned))
+            movementHints.Add(actor.Position, p.pos, Colors.Safe);
+    }
+
+    public override void DrawArenaBackground(int pcSlot, Actor pc)
+    {
+        foreach (var a in AOEs(pcSlot))
+            _shape.Draw(Arena, a.origin, a.rot, a.safe ? Colors.SafeFromAOE : default);
+    }
+
+    public override void DrawArenaForeground(int pcSlot, Actor pc)
+    {
+        foreach (var p in SafeSpots(pcSlot))
+            Arena.AddCircle(p.pos, 1f, p.assigned ? Colors.Safe : default);
+    }
 
     public override void OnStatusGain(Actor actor, ref ActorStatus status)
     {
-        // Monitor 状態の登録（既存ロジック）
         var angle = status.ID switch
         {
             (uint)SID.OversampledWaveCannonLoadingL => 90f.Degrees(),
@@ -50,79 +75,103 @@ sealed class P3OversampledWaveCannonSafe : BossComponent
         }
     }
 
+    public override void OnCastStarted(Actor caster, ActorCastInfo spell)
+    {
+        var angle = spell.Action.ID switch
+        {
+            (uint)AID.OversampledWaveCannonL => 90f.Degrees(),
+            (uint)AID.OversampledWaveCannonR => -90f.Degrees(),
+            _ => default
+        };
+        if (angle != default)
+        {
+            _boss = caster;
+            _bossAngle = angle;
+        }
+    }
+
     private void AssignPlayerOrder()
     {
-        // Monitor 人数が 3 人になったら順番を決める
         int n = 0, m = 0;
         foreach (var sg in _config.P3MonitorsAssignments.Resolve(Raid).OrderBy(sg => sg.group))
         {
             _playerOrder[sg.slot] = IsMonitor(sg.slot) ? ++m : ++n;
+            if (IsMonitor(sg.slot))
+                _monitorOrder.Add(sg.slot);
         }
-    }
-
-    public override void DrawArenaForeground(int pcSlot, Actor pc)
-    {
-        foreach (var (pos, assigned) in SafeSpots(pcSlot))
-            Arena.AddCircle(pos, 1f, assigned ? Colors.Safe : default);
     }
 
     private List<(WPos pos, bool assigned)> SafeSpots(int slot)
     {
         var safespots = new List<(WPos, bool)>();
-
         if (_numPlayerAngles < 3 || _bossAngle == default)
             return safespots;
 
-        // ロールごとのグループを作る
-        var thGroup = Raid.WithSlot().Where(p => IsTH(p.Slot)).ToList();
-        var dpsGroup = Raid.WithSlot().Where(p => IsDPS(p.Slot)).ToList();
+        var thGroup = Raid.WithSlot().Where(t => IsTH(t.slot)).ToList();
+        var dpsGroup = Raid.WithSlot().Where(t => IsDPS(t.slot)).ToList();
 
-        // 各グループで SafeSpot を割り当て
         safespots.AddRange(AssignGroupSafeSpots(thGroup, slot));
         safespots.AddRange(AssignGroupSafeSpots(dpsGroup, slot));
 
         return safespots;
     }
 
-    private List<(WPos pos, bool assigned)> AssignGroupSafeSpots(List<Actor> group, int slot)
+    private List<(WPos pos, bool assigned)> AssignGroupSafeSpots(List<(int slot, Actor actor)> group, int currentSlot)
     {
         var spots = new List<(WPos, bool)>();
-        int monitorCount = group.Count(p => IsMonitor(p.Slot));
+        int monitorCount = group.Count(p => IsMonitor(p.slot));
 
-        // TH/DPS 内で Monitor 数に応じて座標割り当て
         for (int i = 0; i < group.Count; i++)
         {
-            var p = group[i];
-            WPos pos = BasePositions["Center"]; // 初期は中央
+            var (slot, actor) = group[i];
+            WPos pos = BasePositions["Center"];
 
-            // Monitor 調整ルール
-            if (monitorCount == 0)
-            {
-                // そのまま
-                pos = BasePositions["Center"];
-            }
-            else if (monitorCount == 1)
-            {
-                // 横軸 1 人になるよう調整
-                pos = (i == 0) ? BasePositions["WestNear"] : BasePositions["EastNear"];
-            }
-            else if (monitorCount == 2)
-            {
-                // 横 1 / 縦 1 に調整
-                pos = (i == 0) ? BasePositions["WestNear"] : BasePositions["NorthNear"];
-            }
-            else if (monitorCount == 3)
-            {
-                // 横 2 / 縦 1
-                if (i == 0) pos = BasePositions["WestNear"];
-                else if (i == 1) pos = BasePositions["EastNear"];
-                else pos = BasePositions["NorthFar"];
-            }
+            if (monitorCount == 0) pos = BasePositions["Center"];
+            else if (monitorCount == 1) pos = (i == 0) ? BasePositions["WestNear"] : BasePositions["EastNear"];
+            else if (monitorCount == 2) pos = (i == 0) ? BasePositions["WestNear"] : BasePositions["NorthNear"];
+            else if (monitorCount == 3) pos = i switch { 0 => BasePositions["WestNear"], 1 => BasePositions["EastNear"], _ => BasePositions["NorthFar"] };
 
-            spots.Add((pos, p.Slot == slot));
+            spots.Add((pos, slot == currentSlot));
         }
 
         return spots;
     }
-}
 
+    private (WPos origin, Angle rot, bool safe, bool source)[] AOEs(int slot)
+    {
+        var isMonitor = IsMonitor(slot);
+        var order = (isMonitor, _playerOrder[slot]) switch
+        {
+            (_, 1) => 2,
+            (true, _) => 0,
+            (_, 2 or 3) => 1,
+            _ => 3,
+        };
+        var aoes = AOEs();
+        var len = aoes.Length;
+        var aoesNew = new (WPos, Angle, bool, bool)[len];
+        var index = 0;
+        for (var i = 0; i < len; ++i)
+        {
+            ref readonly var aoe = ref aoes[i];
+            if (aoe.origin != null)
+            {
+                aoesNew[index++] = (aoe.origin.Position, aoe.origin.Rotation + aoe.offset, aoe.order == order, isMonitor && aoe.order == _playerOrder[slot]);
+            }
+        }
+        return aoesNew[..index];
+    }
+
+    private (Actor? origin, Angle offset, int order)[] AOEs()
+    {
+        var count = _monitorOrder.Count;
+        var aoes = new (Actor?, Angle, int)[count + 1];
+        aoes[0] = (_boss, _bossAngle, 0);
+        for (var i = 0; i < _monitorOrder.Count; ++i)
+        {
+            var s = _monitorOrder[i];
+            aoes[i + 1] = (Raid[s], _playerAngles[s], i + 1);
+        }
+        return aoes;
+    }
+}
